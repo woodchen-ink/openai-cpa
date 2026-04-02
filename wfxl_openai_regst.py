@@ -59,6 +59,7 @@ class GenerateSubReq(BaseModel):
     api_email: str
     api_key: str
     sync: bool
+    level: int = 1
     
 class CFSyncExistingReq(BaseModel):
     sub_domains: str
@@ -93,48 +94,6 @@ async def verify_token(authorization: str = Header(None)):
         raise HTTPException(status_code=401, detail="登录已过期，请重新登录")
     return token
 
-_FREEMAIL_COOKIE_CACHE = {}
-
-def get_freemail_cookie(fm_url: str, fm_user: str, fm_pass: str, force_refresh=False) -> str:
-    """自动登录 Freemail 并获取 Session Cookie"""
-    if not fm_user: fm_user = "admin"
-    
-    cache_key = f"{fm_url}_{fm_user}_{fm_pass}"
-    if not force_refresh and cache_key in _FREEMAIL_COOKIE_CACHE:
-        return _FREEMAIL_COOKIE_CACHE[cache_key]
-        
-    try:
-        req_url = f"{fm_url}/api/login"
-        payload = json.dumps({"username": fm_user, "password": fm_pass}).encode("utf-8")
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        }
-        
-        print(f"[{core_engine.ts()}] [INFO] 正在尝试登录 Freemail...")
-        r = urllib.request.Request(req_url, data=payload, headers=headers, method="POST")
-        
-        try:
-            resp = urllib.request.urlopen(r, timeout=10)
-        except urllib.error.HTTPError as e:
-            err_msg = e.read().decode('utf-8')
-            print(f"[{core_engine.ts()}] [ERROR] Freemail 登录被拒绝 (HTTP {e.code}): {err_msg}")
-            return ""
-
-        cookie_headers = resp.headers.get_all('Set-Cookie') or []
-        for ch in cookie_headers:
-            for part in ch.split(';'):
-                if part.strip().startswith('mailfree-session='):
-                    cookie_val = part.strip()
-                    _FREEMAIL_COOKIE_CACHE[cache_key] = cookie_val
-                    return cookie_val
-                    
-        print(f"[{core_engine.ts()}] [WARNING] 登录成功，但未在响应头中找到 mailfree-session")
-        return ""
-    except Exception as e:
-        print(f"[{core_engine.ts()}] [ERROR] Freemail 自动登录异常: {e}")
-        return ""
-
 def dispatch_email_backend_add(domain_name: str, cf_cfg: dict):
     email_api_mode = cf_cfg.get("email_api_mode", "")
     enable_sub_domains = cf_cfg.get("enable_sub_domains", False)
@@ -142,78 +101,12 @@ def dispatch_email_backend_add(domain_name: str, cf_cfg: dict):
     if not enable_sub_domains:
         return
 
-    if email_api_mode == "freemail":
-        fm_cfg = cf_cfg.get("freemail", {})
-        fm_url = fm_cfg.get("api_url", "").rstrip("/")
-        fm_user = fm_cfg.get("admin_username", "admin")
-        fm_pass = fm_cfg.get("admin_password", "") 
-        
-        if fm_url and fm_pass:
-            cookie = get_freemail_cookie(fm_url, fm_user, fm_pass)
-            if not cookie: return
-            
-            try:
-                req_url = f"{fm_url}/api/domains"
-                headers = {
-                    "Cookie": cookie,
-                    "Content-Type": "application/json",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                }
-                payload = json.dumps({"domain": domain_name}).encode("utf-8")
-                
-                print(f"[{core_engine.ts()}] [INFO] 正在向 Freemail 推送: {domain_name}")
-                r = urllib.request.Request(req_url, data=payload, headers=headers, method="POST")
-                resp = urllib.request.urlopen(r, timeout=10)
-                
-                print(f"[{core_engine.ts()}] [SUCCESS] Freemail 接收成功")
-                
-            except urllib.error.HTTPError as e:
-                if e.code in (401, 403):
-                    print(f"[{core_engine.ts()}] [WARNING] Cookie 可能已失效，准备触发重新登录...")
-                    get_freemail_cookie(fm_url, fm_user, fm_pass, force_refresh=True)
-                else:
-                    err_msg = e.read().decode('utf-8')
-                    print(f"[{core_engine.ts()}] [ERROR] Freemail 拒绝推送 (HTTP {e.code}): {err_msg}")
-            except Exception as e:
-                print(f"[{core_engine.ts()}] [ERROR] Freemail 请求异常: {e}")
-
 def dispatch_email_backend_delete(domain_name: str, cf_cfg: dict):
     email_api_mode = cf_cfg.get("email_api_mode", "")
     enable_sub_domains = cf_cfg.get("enable_sub_domains", False)
 
     if not enable_sub_domains:
         return
-
-    if email_api_mode == "freemail":
-        fm_cfg = cf_cfg.get("freemail", {})
-        fm_url = fm_cfg.get("api_url", "").rstrip("/")
-        fm_user = fm_cfg.get("admin_username", "admin")
-        fm_pass = fm_cfg.get("admin_password", "")
-        
-        if fm_url and fm_pass:
-            cookie = get_freemail_cookie(fm_url, fm_user, fm_pass)
-            if not cookie: return
-            
-            try:
-                req_url = f"{fm_url}/api/domains?domain={domain_name}"
-                headers = {
-                    "Cookie": cookie,
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                }
-                print(f"[{core_engine.ts()}] [INFO] 正在从 Freemail 删除: {domain_name}")
-                r = urllib.request.Request(req_url, headers=headers, method="DELETE")
-                resp = urllib.request.urlopen(r, timeout=10)
-                
-                print(f"[{core_engine.ts()}] [SUCCESS] Freemail 删除成功")
-                
-            except urllib.error.HTTPError as e:
-                if e.code in (401, 403):
-                    get_freemail_cookie(fm_url, fm_user, fm_pass, force_refresh=True)
-                else:
-                    err_msg = e.read().decode('utf-8')
-                    print(f"[{core_engine.ts()}] [ERROR] Freemail 拒绝删除 (HTTP {e.code}): {err_msg}")
-            except Exception as e:
-                print(f"[{core_engine.ts()}] [ERROR] Freemail 请求异常: {e}")
 
 @app.post("/api/login")
 async def login(data: LoginData):
@@ -358,11 +251,17 @@ async def generate_subdomains_api(req: GenerateSubReq, token: str = Depends(veri
         if not main_list:
             return {"status": "error", "message": "请先在界面上方填写主域名池！"}
 
+        level = getattr(req, 'level', 1)
+
         generated = []
         for main_dom in main_list:
             for _ in range(req.count):
-                prefix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
-                generated.append(f"{prefix}.{main_dom}")
+                random_parts = []
+                for _ in range(level):
+                    random_parts.append(''.join(random.choices(string.ascii_lowercase + string.digits, k=8)))
+                
+                full_sub = ".".join(random_parts) + f".{main_dom}"
+                generated.append(full_sub)
                 
         generated_str = ",".join(generated)
         config_path = "config.yaml"
@@ -374,6 +273,7 @@ async def generate_subdomains_api(req: GenerateSubReq, token: str = Depends(veri
             
         c["sub_domains_list"] = generated_str
         c["sub_domain_count"] = req.count
+        c["sub_domain_level"] = level
         c["cf_api_email"] = req.api_email
         c["cf_api_key"] = req.api_key
         c["enable_sub_domains"] = True
@@ -387,7 +287,7 @@ async def generate_subdomains_api(req: GenerateSubReq, token: str = Depends(veri
         return {
             "status": "success", 
             "domains": generated_str, 
-            "message": f"成功生成 {len(generated)} 个域名，并已自动保存至系统！"
+            "message": f"成功生成 {len(generated)} 个 {level + 1}级 域名，并已自动保存至系统！"
         }
     except Exception as e:
         return {"status": "error", "message": f"执行异常: {str(e)}"}
