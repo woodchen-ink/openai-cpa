@@ -741,25 +741,33 @@ def reauth_cloud_account(req: CloudReauthReq, token: str = Depends(verify_token)
                 return alive, msg
             else:  # sub2api
                 s_client = Sub2APIClient(api_url=cfg.SUB2API_URL, api_key=cfg.SUB2API_KEY)
-                # 先删再加，保证一致（避免同名冲突）
-                s_client.delete_account(req.id)
-                add_ok, add_msg = s_client.add_account(token_data)
-                if not add_ok:
-                    return False, f"Sub2API 重建账号失败: {add_msg}"
+                # 先尝试 update，失败再走删除+新增兜底（保证远端账号不会"只删不建"丢失）
+                updated = False
+                try:
+                    up_ok, _ = s_client.update_account(req.id, {
+                        "credentials": {"refresh_token": token_data.get("refresh_token", "")}
+                    })
+                    updated = bool(up_ok)
+                except Exception:
+                    updated = False
+                if not updated:
+                    s_client.delete_account(req.id)
+                    add_ok, add_msg = s_client.add_account(token_data)
+                    if not add_ok:
+                        return False, f"Sub2API 重建账号失败: {add_msg}"
                 time.sleep(2)
+                # 重新定位账号 id（update 情况下沿用原 id，重建情况下需按 name 查）
+                target_id = req.id
                 ok_list, all_data = s_client.get_all_accounts()
-                new_id = None
                 if ok_list:
                     for it in all_data:
                         if it.get("name") == target_email:
-                            new_id = str(it.get("id"))
+                            target_id = str(it.get("id"))
                             break
-                if not new_id:
-                    return False, "Sub2API 重建后未能再次定位账号"
-                result, msg = s_client.test_account(new_id)
+                result, msg = s_client.test_account(target_id)
                 alive = (result == "ok")
                 if alive:
-                    s_client.set_account_status(new_id, disabled=False)
+                    s_client.set_account_status(target_id, disabled=False)
                 return alive, msg
         except Exception as e:
             return False, f"推送异常: {e}"
