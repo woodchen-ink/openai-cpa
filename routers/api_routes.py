@@ -66,6 +66,12 @@ class CloudAccountItem(BaseModel): id: str; type: str
 class CloudActionReq(BaseModel): accounts: List[CloudAccountItem]; action: str
 
 
+class CloudReauthReq(BaseModel):
+    id: str
+    type: str
+    proxy: Optional[str] = None
+
+
 class ClusterUploadAccountsReq(BaseModel): node_name: str; secret: str; accounts: list
 
 
@@ -649,6 +655,172 @@ def process_cloud_action(req: CloudActionReq, token: str = Depends(verify_token)
     msg = f"测活完毕 | 存活: {success_count} 个 | 失效并已自动禁用: {fail_count} 个" if req.action == "check" else f"指令已下发 | 成功: {success_count} 个 | 失败: {fail_count} 个"
     return {"status": "success" if fail_count == 0 else "warning", "message": msg,
             "updated_details": updated_details_map}
+
+
+@router.post("/api/cloud/reauth")
+def reauth_cloud_account(req: CloudReauthReq, token: str = Depends(verify_token)):
+    """云端失效账号重新授权：先尝试 refresh_token 刷新，失败后退避到老帐号 OAuth 接管。"""
+    from curl_cffi import requests as cffi_req_local
+    from utils import register as register_mod
+    import sqlite3, json as _json
+
+    # 1. 反向定位邮箱（CPA 用文件名，Sub2API 用账号 id->name 反查）
+    target_email = ""
+    target_filename = ""
+    if req.type == "cpa":
+        target_filename = req.id if req.id.endswith(".json") else f"{req.id}.json"
+        target_email = target_filename.replace(".json", "")
+    elif req.type == "sub2api":
+        if not (getattr(cfg, 'SUB2API_URL', None) and getattr(cfg, 'SUB2API_KEY', None)):
+            return {"status": "error", "message": "Sub2API 未配置"}
+        client = Sub2APIClient(api_url=cfg.SUB2API_URL, api_key=cfg.SUB2API_KEY)
+        ok_list, all_data = client.get_all_accounts()
+        if ok_list:
+            for item in all_data:
+                if str(item.get("id")) == str(req.id):
+                    target_email = item.get("name", "").strip()
+                    break
+        if not target_email:
+            return {"status": "error", "message": "Sub2API 远端未匹配到该账号"}
+    else:
+        return {"status": "error", "message": f"未知类型: {req.type}"}
+
+    if not target_email or "@" not in target_email:
+        return {"status": "error", "message": f"无法确定目标邮箱: {target_email or '<空>'}"}
+
+    # 2. 校验本地 accounts 表中存在同邮箱
+    local_token = db_manager.get_token_by_email(target_email)
+    if not local_token:
+        return {"status": "error", "message": f"本地账号库存未找到 {target_email}，无法重新授权"}
+
+    proxy_url = req.proxy or getattr(cfg, 'DEFAULT_PROXY', '') or ''
+    proxy_url = proxy_url.strip() or None
+    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+
+    # 3. 阶段一：refresh_token 快速复活
+    rt = local_token.get("refresh_token", "")
+    refreshed_token_data = None
+    phase1_note = "无本地 refresh_token"
+    if rt:
+        ok, new_tokens = core_engine.refresh_oauth_token(rt, proxies=proxies)
+        if ok:
+            refreshed_token_data = dict(local_token)
+            refreshed_token_data.update(new_tokens)
+            refreshed_token_data["email"] = target_email
+            phase1_note = "refresh_token 刷新成功"
+        else:
+            phase1_note = f"refresh 失败: {new_tokens.get('error','未知')}"
+
+    def _push_and_verify(token_data: dict) -> tuple:
+        """把 token_data 推送到对应云端并立刻测活，返回 (alive, msg)。"""
+        try:
+            if req.type == "cpa":
+                up_ok, up_msg = core_engine.upload_to_cpa_integrated(
+                    token_data, cfg.CPA_API_URL, cfg.CPA_API_TOKEN,
+                    custom_filename=target_filename,
+                )
+                if not up_ok:
+                    return False, f"CPA 覆盖上传失败: {up_msg}"
+                time.sleep(2)
+                res = cffi_req_local.get(
+                    core_engine._normalize_cpa_auth_files_url(cfg.CPA_API_URL),
+                    headers={"Authorization": f"Bearer {cfg.CPA_API_TOKEN}"},
+                    timeout=15, impersonate="chrome110",
+                )
+                item = None
+                if res.status_code == 200:
+                    for f in res.json().get("files", []):
+                        if f.get("name") == target_filename:
+                            item = f
+                            break
+                if not item:
+                    return False, "CPA 文件刚上传后未能再次定位"
+                alive, msg = core_engine.test_cliproxy_auth_file(item, cfg.CPA_API_URL, cfg.CPA_API_TOKEN)
+                if alive:
+                    core_engine.set_cpa_auth_file_status(cfg.CPA_API_URL, cfg.CPA_API_TOKEN, target_filename, disabled=False)
+                return alive, msg
+            else:  # sub2api
+                s_client = Sub2APIClient(api_url=cfg.SUB2API_URL, api_key=cfg.SUB2API_KEY)
+                # 先删再加，保证一致（避免同名冲突）
+                s_client.delete_account(req.id)
+                add_ok, add_msg = s_client.add_account(token_data)
+                if not add_ok:
+                    return False, f"Sub2API 重建账号失败: {add_msg}"
+                time.sleep(2)
+                ok_list, all_data = s_client.get_all_accounts()
+                new_id = None
+                if ok_list:
+                    for it in all_data:
+                        if it.get("name") == target_email:
+                            new_id = str(it.get("id"))
+                            break
+                if not new_id:
+                    return False, "Sub2API 重建后未能再次定位账号"
+                result, msg = s_client.test_account(new_id)
+                alive = (result == "ok")
+                if alive:
+                    s_client.set_account_status(new_id, disabled=False)
+                return alive, msg
+        except Exception as e:
+            return False, f"推送异常: {e}"
+
+    if refreshed_token_data:
+        alive, test_msg = _push_and_verify(refreshed_token_data)
+        if alive:
+            # 落地到本地 DB
+            try:
+                with sqlite3.connect(db_manager.DB_PATH, timeout=10) as _conn:
+                    _conn.execute("UPDATE accounts SET token_data=? WHERE email=?",
+                                  (_json.dumps(refreshed_token_data, ensure_ascii=False), target_email))
+            except Exception:
+                pass
+            return {"status": "success",
+                    "message": f"刷新复活成功 [{target_email}] | {phase1_note} | 测活: {test_msg}",
+                    "phase": "refresh"}
+        phase1_note = f"{phase1_note} | 刷新后测活失败: {test_msg}"
+
+    # 4. 阶段二：退避到老帐号 OAuth 接管
+    print(f"[{cfg.ts()}] [INFO] Reauth 阶段二启动: {target_email} (阶段一: {phase1_note})")
+    run_ctx = {}
+    try:
+        result = register_mod.run(proxy_url, run_ctx=run_ctx,
+                                  existing_account={"email": target_email, "jwt": ""})
+    except Exception as e:
+        return {"status": "error",
+                "message": f"[{target_email}] 阶段一: {phase1_note} | 阶段二异常: {e}",
+                "phase": "takeover"}
+
+    token_json_str = None
+    if result and isinstance(result, (tuple, list)) and len(result) >= 1:
+        token_json_str = result[0]
+    if not token_json_str or token_json_str == "retry_403":
+        return {"status": "error",
+                "message": f"[{target_email}] 阶段一: {phase1_note} | 阶段二老帐号 OAuth 未拿到凭据",
+                "phase": "takeover"}
+
+    try:
+        new_token_data = _json.loads(token_json_str)
+    except Exception:
+        return {"status": "error", "message": "阶段二返回的 token_data 解析失败", "phase": "takeover"}
+    new_token_data["email"] = target_email
+
+    alive, test_msg = _push_and_verify(new_token_data)
+    # 同步回本地 DB
+    try:
+        with sqlite3.connect(db_manager.DB_PATH, timeout=10) as _conn:
+            _conn.execute("UPDATE accounts SET token_data=? WHERE email=?",
+                          (_json.dumps(new_token_data, ensure_ascii=False), target_email))
+    except Exception:
+        pass
+
+    if alive:
+        return {"status": "success",
+                "message": f"老帐号 OAuth 接管成功 [{target_email}] | 阶段一: {phase1_note} | 测活: {test_msg}",
+                "phase": "takeover"}
+    return {"status": "warning",
+            "message": f"老帐号 OAuth 已拿到新 Token 并上传，但测活仍失败 [{target_email}]: {test_msg}",
+            "phase": "takeover"}
+
 
 @router.get('/api/sms/balance')
 def api_get_sms_balance(token: str = Depends(verify_token)):

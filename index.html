@@ -1937,10 +1937,14 @@
                                                 {{ acc.last_check || '-' }}
                                             </td>
 
-                                            <td class="px-5 md:px-8 py-4 whitespace-nowrap text-center text-sm font-bold flex gap-2 justify-center mt-2 md:mt-4">
+                                            <td class="px-5 md:px-8 py-4 whitespace-nowrap text-center text-sm font-bold flex gap-2 justify-center mt-2 md:mt-4 flex-wrap">
                                                 <button @click="singleCloudAction(acc, 'check')" :disabled="acc._loading" class="text-blue-700 bg-blue-50 border border-blue-200 hover:bg-blue-100 px-3 py-1.5 rounded-lg active:scale-95 transition-all shadow-sm disabled:opacity-50 min-w-[60px] flex items-center justify-center">
                                                     <span v-if="acc._loading === 'check'" class="animate-spin text-base">⏳</span>
                                                     <span v-else>测活</span>
+                                                </button>
+                                                <button v-if="acc.status === 'dead'" @click="reauthCloudAccount(acc)" :disabled="acc._loading" title="先尝试本地 refresh_token 刷新，失败后自动退避走老帐号 OAuth 接管" class="text-indigo-700 bg-indigo-50 border border-indigo-200 hover:bg-indigo-100 px-3 py-1.5 rounded-lg active:scale-95 transition-all shadow-sm disabled:opacity-50 min-w-[80px] flex items-center justify-center">
+                                                    <span v-if="acc._loading === 'reauth'" class="animate-spin text-base">⏳</span>
+                                                    <span v-else>重新授权</span>
                                                 </button>
                                                 <button @click="singleCloudAction(acc, acc.status === 'disabled' ? 'enable' : 'disable')" :disabled="acc._loading" :class="acc.status === 'disabled' ? 'text-emerald-700 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100' : 'text-amber-700 bg-amber-50 border border-amber-200 hover:bg-amber-100'" class="px-3 py-1.5 rounded-lg active:scale-95 transition-all shadow-sm disabled:opacity-50 min-w-[60px] flex items-center justify-center">
                                                     <span v-if="acc._loading === 'enable' || acc._loading === 'disable'" class="animate-spin text-base">⏳</span>

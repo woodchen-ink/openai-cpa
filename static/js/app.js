@@ -1423,6 +1423,32 @@ createApp({
             }
         },
 
+        async reauthCloudAccount(acc) {
+            if (!confirm(`即将对 [${acc.credential}] 执行重新授权：\n\n1) 优先用本地 refresh_token 刷新并测活；\n2) 若失败，自动退避至【老帐号 OAuth 接管】，需要邮箱能收到验证码。\n\n该流程耗时较长，确定继续吗？`)) return;
+            this.showToast(`正在对 [${acc.credential}] 重新授权，请耐心等待...`, 'info');
+            acc._loading = 'reauth';
+            try {
+                const res = await this.authFetch('/api/cloud/reauth', {
+                    method: 'POST',
+                    body: JSON.stringify({ id: String(acc.id), type: acc.account_type })
+                });
+                const result = await res.json();
+                this.showToast(result.message || '操作完成', result.status || 'info');
+                if (result.status === 'success') {
+                    acc.status = 'active';
+                    const now = new Date().toLocaleString('zh-CN', { hour12: false });
+                    this.localCheckTimes[acc.id] = now;
+                    acc.last_check = now;
+                    setTimeout(() => this.fetchCloudAccounts(), 1500);
+                }
+            } catch (e) {
+                console.error(e);
+                this.showToast('重新授权请求异常', 'error');
+            } finally {
+                acc._loading = null;
+            }
+        },
+
         async bulkCloudAction(action) {
             if (this.selectedCloud.length === 0) {
                 return this.showToast('请先勾选需要操作的账号', 'warning');

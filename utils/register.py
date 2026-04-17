@@ -398,7 +398,10 @@ def _parse_workspace_from_auth_cookie(auth_cookie: str) -> list:
     return claims.get("workspaces") or []
 
 
-def run(proxy: Optional[str], run_ctx: dict = None) -> tuple:
+def run(proxy: Optional[str], run_ctx: dict = None,
+        existing_account: Optional[Dict[str, str]] = None) -> tuple:
+    # existing_account: 当传入 {"email": ..., "jwt": ...} 时，跳过新邮箱分配，
+    # 直接对该邮箱走"老帐号 OAuth 接管"流程，用于云端失效账号重新授权。
     processed_mails: set = set()
     proxy = cfg.format_docker_url(proxy)
     if proxy and proxy.startswith("socks5://"):
@@ -409,6 +412,7 @@ def run(proxy: Optional[str], run_ctx: dict = None) -> tuple:
     is_takeover = False
     is_onephone = False
     target_continue_url = ""
+    force_takeover = bool(existing_account and existing_account.get("email"))
     if not _skip_net_check():
         try:
             start = time.time()
@@ -425,7 +429,12 @@ def run(proxy: Optional[str], run_ctx: dict = None) -> tuple:
             print(f"[{cfg.ts()}] [ERROR] 代理网络检查失败: {e}")
             return None, None
 
-    email, email_jwt = get_email_and_token(proxies)
+    if force_takeover:
+        email = str(existing_account.get("email") or "").strip()
+        email_jwt = str(existing_account.get("jwt") or "").strip()
+        print(f"[{cfg.ts()}] [INFO] 复用既有邮箱走老帐号 OAuth 接管: ({mask_email(email)})")
+    else:
+        email, email_jwt = get_email_and_token(proxies)
     if not email:
         return None, None
 
@@ -479,9 +488,12 @@ def run(proxy: Optional[str], run_ctx: dict = None) -> tuple:
             try:
                 signup_json = signup_resp.json()
                 continue_url = signup_json.get("continue_url", "")
-                if "log-in" in continue_url:
+                if "log-in" in continue_url or force_takeover:
                     is_takeover = True
-                    print(f"[{cfg.ts()}] [WARNING] （{mask_email(email)}）该邮箱已注册！准备走【无密码邮箱验证码】接管登录...")
+                    if force_takeover and "log-in" not in continue_url:
+                        print(f"[{cfg.ts()}] [INFO] （{mask_email(email)}）强制走老帐号 OAuth 接管（用于云端重新授权）...")
+                    else:
+                        print(f"[{cfg.ts()}] [WARNING] （{mask_email(email)}）该邮箱已注册！准备走【无密码邮箱验证码】接管登录...")
                     login_ctx = reg_ctx.copy() if reg_ctx else {}
                     sentinel_login = generate_payload(did=did, flow="password_verify", proxy=proxy, user_agent=current_ua,
                                                       impersonate="chrome110", ctx=login_ctx)
